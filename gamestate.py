@@ -160,18 +160,6 @@ def normalize_pai(pai: str) -> str:
 
 
 def _is_winning_counts(counts: List[int], open_melds: int = 0) -> bool:
-    """
-    counts contains only the CLOSED tiles currently in hand, represented in base-34.
-    open_melds is the number of already-open 3-tile melds outside the hand.
-
-    A complete hand must satisfy:
-        closed_tiles + 3 * open_melds == 14
-
-    and the closed portion itself must be decomposable into:
-        1 pair + (4 - open_melds) melds
-
-    Special hands (chiitoitsu / kokushi) are only valid for fully closed hands.
-    """
     total = sum(counts)
     required_closed_tiles = 14 - 3 * open_melds
     if total != required_closed_tiles:
@@ -289,8 +277,10 @@ class RoundState:
         self.last_discard_tile: Optional[int] = None
         self.last_discard_actor: Optional[int] = None
 
-        # (type_id, actor_id, target_id, tile_id, red_flag, tsumogiri_flag, call_kind_id, riichi_flag)
         self.history: List[Tuple[int, int, int, int, int, int, int, int]] = []
+
+        # Track which players' hands are visible (known) to us
+        self.hand_known: List[bool] = [False, False, False, False]
 
     def start_kyoku(self, event: dict):
         self.discards = [[0] * NUM_TILES for _ in range(4)]
@@ -313,8 +303,13 @@ class RoundState:
         self.history = []
 
         self.hands = [[] for _ in range(4)]
+        self.hand_known = [False, False, False, False]
         for pid in range(4):
-            self.hands[pid] = [p for p in event["tehais"][pid] if p != "?"]
+            tiles = [p for p in event["tehais"][pid] if p != "?"]
+            self.hands[pid] = tiles
+            # If tehais[pid] has real tiles (not all "?"), we know this hand
+            if tiles:
+                self.hand_known[pid] = True
 
     # ----------------------------------------------------------
     # Hand utilities
@@ -435,7 +430,6 @@ class RoundState:
 
         result = set()
 
-        # ankan
         for base34 in range(34):
             if counts34[base34] >= 4:
                 for idx37 in self._base34_to_possible_37_indices(base34):
@@ -443,7 +437,6 @@ class RoundState:
                         result.add(idx37)
                         break
 
-        # kakan
         for base34 in range(34):
             if meld34[base34] >= 3 and counts34[base34] >= 1:
                 for idx37 in self._base34_to_possible_37_indices(base34):
@@ -563,7 +556,6 @@ class RoundState:
             rel_actor = (actor_id - observer) % 4 if actor_id < 4 else actor_id
             rel_target = (target_id - observer) % 4 if target_id < 4 else target_id
 
-            # Hide opponents' drawn tiles in history
             if type_id == EVENT_TYPE_TO_IDX["tsumo"] and actor_id != observer:
                 tile_id = PAD_TILE
                 red_flag = 0
@@ -708,7 +700,6 @@ class RoundState:
         vals = sorted(tile37_to_base34(pai_to_idx(t)) for t in consumed + [pai])
 
         if vals != [called, called + 1, called + 2]:
-            # middle tile
             if vals == [called - 1, called, called + 1]:
                 return "chi_mid"
             if vals == [called - 2, called - 1, called]:
@@ -727,6 +718,7 @@ class RoundState:
         if pai != "?":
             self.hands[actor].append(pai)
             self.last_draw[actor] = pai
+            self.hand_known[actor] = True
 
     def on_dahai(self, event: dict):
         actor = event["actor"]
@@ -735,7 +727,10 @@ class RoundState:
 
         tile_idx = pai_to_idx(pai)
         self.discards[actor][tile_idx] += 1
-        self._remove_one_tile(self.hands[actor], pai)
+
+        # Only remove from hand if we actually know this player's hand
+        if self.hand_known[actor] and self.hands[actor]:
+            self._remove_one_tile(self.hands[actor], pai)
 
         self.last_discard_tile = tile_idx
         self.last_discard_actor = actor
@@ -766,10 +761,13 @@ class RoundState:
         self.dora_indicators.append(pai_to_idx(event["dora_marker"]))
 
     def _apply_meld(self, actor: int, consumed: List[str], called_pai: Optional[str] = None):
+        # Only remove consumed tiles from hand if we know this hand
+        if self.hand_known[actor]:
+            for t in consumed:
+                self._remove_one_tile(self.hands[actor], t)
         for t in consumed:
             idx = pai_to_idx(t)
             self.melds[actor][idx] += 1
-            self._remove_one_tile(self.hands[actor], t)
         if called_pai:
             self.melds[actor][pai_to_idx(called_pai)] += 1
 
@@ -790,10 +788,13 @@ class RoundState:
 
     def on_ankan(self, event: dict):
         actor = event["actor"]
-        for t in event.get("consumed", []):
+        consumed = event.get("consumed", [])
+        for t in consumed:
             idx = pai_to_idx(t)
             self.melds[actor][idx] += 1
-            self._remove_one_tile(self.hands[actor], t)
+        if self.hand_known[actor]:
+            for t in consumed:
+                self._remove_one_tile(self.hands[actor], t)
 
     def on_kakan(self, event: dict):
         actor = event["actor"]
@@ -801,7 +802,8 @@ class RoundState:
         if pai:
             idx = pai_to_idx(pai)
             self.melds[actor][idx] += 1
-            self._remove_one_tile(self.hands[actor], pai)
+            if self.hand_known[actor]:
+                self._remove_one_tile(self.hands[actor], pai)
 
     def on_hora(self, event: dict):
         self._update_scores_from_event(event)
